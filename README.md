@@ -2,7 +2,7 @@
 
 A distributed financial transaction processing service for an iGaming platform, implemented with **NestJS**, **TypeScript**, **Bun**, **PostgreSQL 16**, **MikroORM**, **decimal.js**, and **AWS SQS FIFO** (emulated locally with LocalStack).
 
-> **Status:** Technical challenge implementation. Core financial operations, persistence, HTTP endpoints, outbox/inbox infrastructure, and pending-reference recovery are implemented. The project is **not presented as production-ready**; see [Known limitations](#known-limitations-and-next-steps) and [ARCHITECTURE.md](ARCHITECTURE.md).
+> **Status:** Technical challenge implementation. Core financial operations, persistence, HTTP endpoints, outbox/inbox infrastructure, and pending-reference recovery are implemented. The project is **not presented as production-ready**; see [Known limitations](#known-limitations-and-next-steps) 
 
 ## Overview
 
@@ -80,7 +80,6 @@ src/
 
 test/                                 # Integration / concurrency tests
 README.md
-ARCHITECTURE.md
 ```
 
 The `application` layer coordinates use cases; `domain` encapsulates money and transaction rules; `infrastructure` integrates PostgreSQL and SQS; `interfaces/http` exposes the API. The `ports` directory contains an outbound messaging abstraction.
@@ -252,10 +251,6 @@ Run these using the Bun invocation appropriate for your package scripts and Type
 4. Add provider authentication/authorization, structured logs, metrics, and health checks before any production deployment.
 5. Verify a clean-database migration and full integration test run in a reproducible environment.
 6. Review canonical payload hashing rules for normalization (e.g. equivalent monetary representations) and compatibility with legacy test records.
-
-## Further reading
-
-- [ARCHITECTURE.md](ARCHITECTURE.md): boundaries, transaction model, concurrency, idempotency, outbox/inbox, recovery, trade-offs, and verification gaps.
 
 ---
 
