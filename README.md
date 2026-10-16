@@ -1,165 +1,111 @@
 # Jungle Financial Service
 
-A financial transaction processing service for an iGaming platform, built with **NestJS**, **TypeScript**, **Bun**, **PostgreSQL**, **MikroORM**, and **AWS SQS FIFO** (via LocalStack for local development).
+A distributed financial transaction processing service for an iGaming platform, implemented with **NestJS**, **TypeScript**, **Bun**, **PostgreSQL 16**, **MikroORM**, **decimal.js**, and **AWS SQS FIFO** (emulated locally with LocalStack).
 
-> **Project status:** Core financial use cases, persistence, messaging infrastructure, and HTTP endpoints are implemented. BET, WIN, and LOSS have been exercised through HTTP; REFUND and ROLLBACK HTTP flows and end-to-end messaging still require final verification. This README describes the current implementation, not a production-readiness certification.
+> **Status:** Technical challenge implementation. Core financial operations, persistence, HTTP endpoints, outbox/inbox infrastructure, and pending-reference recovery are implemented. The project is **not presented as production-ready**; see [Known limitations](#known-limitations-and-next-steps) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Overview
 
-The service processes provider-originated wager transactions against player wallets. Its design emphasizes financial correctness under retries, concurrent requests, process crashes, and multiple service instances.
+The service processes provider-originated wager transactions against player wallets. It prioritizes:
 
-Key properties:
-
-- Monetary amounts are represented using decimal-safe values (`decimal.js`), not JavaScript floating-point arithmetic.
-- Wallet mutations and ledger entries are committed within a PostgreSQL transaction.
-- Wallet rows are locked during balance-changing operations to prevent lost updates.
-- Provider transaction identity and idempotency are persisted in the database.
-- The ledger is append-only, with database-enforced constraints and immutability protections.
-- Integration events are persisted using a **Transactional Outbox** and published asynchronously.
-- An **Inbox** provides durable consumer-side deduplication.
-- Pending references can be retried when their original transaction becomes available.
+- **Financial precision:** monetary amounts are decimal strings, represented using `decimal.js` rather than JavaScript floating-point arithmetic.
+- **Atomicity:** transaction state, wallet balance, ledger entries, and outbox records are persisted within the same PostgreSQL transaction.
+- **Concurrency safety:** row-level locks serialize mutations of a given wallet without a global lock.
+- **Persistent idempotency:** provider identities and idempotency keys are stored in PostgreSQL; repeated requests must not apply money movements twice.
+- **Auditability:** immutable, append-only ledger entries support balance reconciliation.
+- **Asynchronous delivery:** a transactional outbox publishes events to SQS FIFO after commit; a durable inbox supports consumer deduplication.
+- **Recovery:** REFUND and ROLLBACK requests with missing references may be persisted as `PENDING_REFERENCE` and retried.
 
 ## Technology stack
 
-| Area | Technology |
+| Concern | Technology |
 | --- | --- |
-| HTTP API | NestJS, TypeScript |
-| Runtime / package manager | Bun |
+| HTTP API | NestJS, TypeScript, class-validator |
+| Runtime and package manager | Bun |
 | Database | PostgreSQL 16 |
-| ORM and migrations | MikroORM (EntitySchema) |
+| ORM / schema migrations | MikroORM with EntitySchema |
 | Monetary arithmetic | decimal.js |
-| Message transport | AWS SQS FIFO |
-| Local message broker emulation | LocalStack |
-| Infrastructure | Docker |
-| Tests | Bun test runner |
+| Messaging | AWS SQS FIFO |
+| Local SQS emulation | LocalStack |
+| Local infrastructure | Docker |
+| Testing | Bun test runner, real PostgreSQL integration tests |
 
-## Architecture
+### Source tree
 
-The codebase separates domain rules from application orchestration and infrastructure:
+The tree below highlights the principal implementation files rather than every generated file, test fixture, or migration:
 
 ```text
 src/
-├── domain/
-│   ├── entities/                 # Wallet, wager transaction, ledger entry
-│   └── value-objects/            # Money
 ├── application/
-│   ├── use-cases/                # BET, WIN, LOSS, REFUND, ROLLBACK, resolution
-│   └── services/                 # Outbox, inbox, reconciliation, recovery
+│   ├── ports/
+│   │   └── outbox-event-publisher.ts
+│   ├── services/
+│   │   ├── financial-outbox.service.ts
+│   │   ├── inbox-processor.service.ts
+│   │   ├── outbox-worker.service.ts
+│   │   ├── pending-reference-recovery.service.ts
+│   │   ├── wallet-reconciliation.service.ts
+│   │   └── wallet-transaction.service.ts
+│   └── use-cases/
+│       ├── process-bet.use-case.ts
+│       ├── process-win.use-case.ts
+│       ├── process-loss.use-case.ts
+│       ├── process-refund.use-case.ts
+│       ├── process-rollback.use-case.ts
+│       ├── resolve-pending-refunds.use-case.ts
+│       └── resolve-pending-rollbacks.use-case.ts
+├── domain/
+│   ├── entities/
+│   │   ├── wallet.ts
+│   │   ├── wallet-ledger-entry.ts
+│   │   └── wager-transaction.ts
+│   └── value-objects/
+│       └── money.ts
 ├── infrastructure/
-│   ├── persistence/              # MikroORM repositories, entities, migrations
-│   └── messaging/                # SQS publisher/consumer and workers
+│   ├── persistence/
+│   │   ├── entities/                  # MikroORM schemas
+│   │   └── repositories/             # Wallet, ledger, wager, inbox, outbox
+│   └── messaging/                    # SQS adapters and worker entry points
 ├── interfaces/
-│   └── http/                     # NestJS controller, DTOs, module
+│   └── http/
+│       ├── financial-payload-hash.ts
+│       ├── financial-transaction.dto.ts
+│       ├── financial.controller.ts
+│       └── financial.module.ts
+├── migrations/                       # Database schema migrations
 ├── app.module.ts
 ├── main.ts
-└── mikro-orm.config.ts
+├── mikro-orm.config.ts
+└── mikro-orm.test.config.ts
+
+test/                                 # Integration / concurrency tests
+README.md
+ARCHITECTURE.md
 ```
 
-The HTTP layer delegates to application use cases. The use cases coordinate domain entities and repositories, while PostgreSQL provides the transactional boundary and database-level invariants.
+The `application` layer coordinates use cases; `domain` encapsulates money and transaction rules; `infrastructure` integrates PostgreSQL and SQS; `interfaces/http` exposes the API. The `ports` directory contains an outbound messaging abstraction.
 
 ## Financial operations
 
-| Operation | Wallet effect | Ledger effect | Notes |
+| Operation | Wallet effect | Ledger effect | Behavior |
 | --- | --- | --- | --- |
-| `BET` | Debit | One `DEBIT` | Rejects insufficient balance |
-| `WIN` | Credit | One `CREDIT` | Can belong to the same round as a BET |
-| `LOSS` | None | None | Records the outcome only |
+| `BET` | Debit | One `DEBIT` | Rejects insufficient funds |
+| `WIN` | Credit | One `CREDIT` | Records winnings |
+| `LOSS` | None | None | Records the result without moving money |
 | `REFUND` | Credit | One `CREDIT` | Reverses an eligible processed BET once |
-| `ROLLBACK` | Inverse of reference | One inverse entry | Reverses an eligible processed BET, WIN, or REFUND |
+| `ROLLBACK` | Inverse of referenced effect | One inverse entry | Reverses an eligible processed BET, WIN, or REFUND |
 
-Rejected transactions do not change wallet balances or produce ledger entries. Repeated requests with the same idempotency identity and matching payload return the original result without applying the financial effect again.
-
-### Reference handling
-
-REFUND and ROLLBACK identify their target using `providerId` and `referenceExternalTransactionId`. Reference validation checks ownership and transaction context (provider, player, wallet, currency, and round), as well as eligible status and reversal rules. An unresolved reference may be recorded as `PENDING_REFERENCE` and retried later.
-
-Partial reversals are outside the current scope.
-
-## Consistency and failure recovery
-
-### Concurrency and ledger
-
-- Wallet updates execute inside database transactions and use row-level locking.
-- Balance-changing operations write a matching immutable ledger entry.
-- Database constraints enforce key uniqueness and prevent invalid wallet balances.
-- The reconciliation service compares the materialized wallet balance against the net ledger total.
-- A global application lock is not required.
-
-### Transactional Outbox
-
-Transaction state, wallet changes, ledger entries, and outbox records are persisted atomically. The publisher processes committed outbox records and sends them to SQS FIFO. Publishing is **at least once**: a crash after publish but before marking an event as delivered can cause a duplicate, so consumers must be idempotent.
-
-Event types include:
-
-- `WagerTransactionProcessed`
-- `WagerTransactionRejected`
-- `WagerTransactionPendingReference`
-- `WalletBalanceChanged` (only when the wallet balance changes)
-
-### Inbox and pending-reference recovery
-
-The Inbox records consumed message identities in PostgreSQL to suppress duplicate processing. The current SQS consumer includes the inbox/deduplication infrastructure; its example event handler logs messages and is **not** a complete downstream business integration.
-
-A separate recovery service periodically scans resolvable `PENDING_REFERENCE` records and retries the corresponding REFUND/ROLLBACK logic. Recovery is designed to tolerate re-execution.
-
-## Local prerequisites
-
-- Bun (project tested with Bun 1.4.x)
-- Node.js (for tooling where applicable)
-- Docker with PostgreSQL and LocalStack containers
-- PowerShell or another shell
-
-The development setup used PostgreSQL container `jungle-postgres` and LocalStack container `jungle-localstack`. Check the repository's Docker configuration before starting containers: container creation and queue bootstrap commands depend on the local setup.
-
-## Configuration
-
-Create a `.env` file in the project root. The database configuration reads these variables:
-
-```dotenv
-DATABASE_HOST=127.0.0.1
-DATABASE_PORT=5432
-DATABASE_USER=<your_database_user>
-DATABASE_PASSWORD=<your_database_password>
-DATABASE_NAME=jungle_financial
-PORT=3000
-```
-
-The SQS publisher/consumer may require additional AWS region, credentials, endpoint, and queue URL variables. Check the configuration in `src/infrastructure/messaging/` and supply values appropriate for AWS or LocalStack.
-
-**Never commit `.env`, passwords, or production credentials.** Use a separate database for integration tests.
-
-## Install and run
-
-```powershell
-bun install --frozen-lockfile
-bunx mikro-orm migration:up
-bun --bun run start:dev
-```
-
-> The migration command targets the database configured by the current environment. Verify `DATABASE_NAME` before applying migrations. On Windows, `bun --bun run start:dev` was used successfully after repairing an inconsistent dependency installation.
-
-The HTTP server listens on port `3000` by default.
-
-### Use the test database without editing `.env`
-
-In the terminal used to launch the API:
-
-```powershell
-$env:DATABASE_NAME = "jungle_financial_test"
-bun --bun run start:dev
-```
-
-The environment variable takes precedence over the `.env` default in the current configuration. Use a dedicated test database with migrated tables and seeded test wallets.
+Rejected operations do not change the balance or append financial ledger entries. Partial reversals are out of scope. References are identified by `(providerId, referenceExternalTransactionId)` and validated against the player, wallet, currency, round, status, and reversal rules.
 
 ## HTTP API
 
-| Method | Route | Description |
+| Method | Endpoint | Purpose |
 | --- | --- | --- |
-| POST | `/transactions/bet` | Debit a wallet for a wager |
-| POST | `/transactions/win` | Credit a wallet for a win |
-| POST | `/transactions/loss` | Record a loss without changing balance |
-| POST | `/transactions/refund` | Refund an eligible BET |
-| POST | `/transactions/rollback` | Reverse an eligible transaction |
+| `POST` | `/transactions/bet` | Place a wager / debit a wallet |
+| `POST` | `/transactions/win` | Credit winnings |
+| `POST` | `/transactions/loss` | Record a loss |
+| `POST` | `/transactions/refund` | Refund a BET |
+| `POST` | `/transactions/rollback` | Reverse a processed operation |
 
 ### Example: BET
 
@@ -172,18 +118,19 @@ Content-Type: application/json
 {
   "walletId": "ae93a283-ebd3-440a-bb8a-cda4491a289b",
   "providerId": "provider-http-test",
-  "externalTransactionId": "bet-http-001",
-  "idempotencyKey": "bet-http-001",
-  "payloadHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "externalTransactionId": "bet-example-001",
+  "idempotencyKey": "bet-example-001",
   "playerId": "test-player-45413e24-cc5f-4da1-a3e6-f2bb986af4fd",
-  "roundId": "round-http-001",
-  "gameId": "game-http-001",
+  "roundId": "round-example-001",
+  "gameId": "game-example-001",
   "amount": "30.00",
   "currency": "BRL"
 }
 ```
 
-Example successful response:
+**Do not send `payloadHash`.** The HTTP controller calculates a SHA-256 hash from selected transaction fields, including the operation type. The internal application use cases still receive the computed hash.
+
+Example successful response (assuming the wallet starts at `100.00`):
 
 ```json
 {
@@ -194,79 +141,121 @@ Example successful response:
 }
 ```
 
-Sending the **same request again** should return the original transaction with `idempotentReplay: true` and must not debit the wallet again.
+Sending the identical request again should return the original transaction ID with `idempotentReplay: true`, without a second debit. Reusing the same idempotency identity with a different payload is rejected by the application; **HTTP mapping of that conflict to 409 is still pending** (it currently surfaces as 500 in the tested LOSS scenario).
 
-### REFUND / ROLLBACK payloads
-
-Both reversal endpoints use the same base fields plus:
+For `REFUND` and `ROLLBACK`, include all common fields plus `referenceExternalTransactionId`:
 
 ```json
 {
-  "referenceExternalTransactionId": "bet-http-001"
+  "referenceExternalTransactionId": "bet-example-001"
 }
 ```
 
-This is an **additional field**, not a complete request body. The referenced transaction must satisfy the business rules.
+The snippet above shows **only the additional field**, not a complete request body.
 
 ### Input validation
 
-- `walletId` must be a UUID.
-- `amount` must be a decimal **string** with two fractional digits, for example `"30.00"`.
-- `currency` must be a three-letter uppercase code such as `BRL`.
-- `payloadHash` is currently accepted as a 64-character hexadecimal string.
-- Unknown DTO properties and invalid input types are rejected with HTTP `400`.
+- `walletId`: UUID.
+- `amount`: decimal **string** with exactly two fractional digits (e.g. `"30.00"`), not a JSON number.
+- `currency`: three uppercase letters (e.g. `BRL`).
+- Other identifiers: required strings as defined by the DTOs.
+- Reversal requests: require `referenceExternalTransactionId`.
 
-**Important:** the current API accepts `payloadHash` from the caller. Before production deployment, compute a canonical payload hash server-side and authenticate/authorize providers. Business exceptions also require a reviewed mapping to appropriate HTTP status codes.
+The DTO no longer declares `payloadHash`. Strict rejection of extra request fields depends on the application's configured `ValidationPipe` and should be verified separately.
 
-## Tests
+## Consistency, messaging, and recovery
 
-Run all tests:
+**Database consistency.** Balance-changing operations use PostgreSQL transactions and wallet row locks. The immutable ledger records the corresponding debit or credit; a reconciliation service compares ledger totals with the materialized wallet balance.
 
-```powershell
-bun test
+**Transactional outbox.** Events are written in the same commit as financial state. A separate worker publishes committed records to SQS FIFO. Publication is **at least once**, so downstream consumers must tolerate duplicates.
+
+**Events:** `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference`, and `WalletBalanceChanged` (only when the balance changes).
+
+**Inbox.** The consumer persists message identities in PostgreSQL to deduplicate processing. The current SQS consumer's example handler logs received events; it is **not** a completed downstream business integration.
+
+**Pending references.** Recovery scans eligible `PENDING_REFERENCE` reversals and retries REFUND / ROLLBACK processing. A one-off command and a periodic worker are available.
+
+## Local setup
+
+### Prerequisites
+
+- Bun (the project has been exercised with Bun 1.4.x).
+- Node.js for tools that require it.
+- Docker with PostgreSQL 16 and LocalStack.
+- A PostgreSQL database and an SQS FIFO queue configured for this project.
+
+The local development environment previously used containers named `jungle-postgres` and `jungle-localstack`, with queue `jungle-financial-events.fifo`. Container/queue bootstrap commands depend on the repository's Docker setup and are not assumed here.
+
+### Environment
+
+Create `.env` in the project root (do not commit it):
+
+```dotenv
+DATABASE_HOST=127.0.0.1
+DATABASE_PORT=5432
+DATABASE_USER=<database_user>
+DATABASE_PASSWORD=<database_password>
+DATABASE_NAME=jungle_financial
+PORT=3000
 ```
 
-Check TypeScript:
+The messaging adapters also require SQS configuration (endpoint, region, credentials, queue URL); consult `src/infrastructure/messaging/` for the exact environment variable names used in this checkout. For local emulation, use LocalStack-specific credentials rather than production credentials.
+
+### Install, migrate, run
 
 ```powershell
+bun install --frozen-lockfile
+bunx mikro-orm migration:up
+bun --bun run start:dev
+```
+
+**Safety:** verify the selected `DATABASE_NAME` before migrations or manual API calls. To launch the API against the isolated test database in the current PowerShell session:
+
+```powershell
+$env:DATABASE_NAME = "jungle_financial_test"
+bun --bun run start:dev
+```
+
+The test database needs its own schema migrations and seeded wallet data. Do not use a production database for integration tests.
+
+## Tests and verification
+
+```powershell
+# Ensure the test DB guard points to the dedicated database
+$env:POSTGRES_DB = "jungle_financial_test"
+$env:DATABASE_NAME = "jungle_financial_test"
+
+bun test
 bunx tsc --noEmit
 ```
 
-The project previously passed **88 tests across 22 files**. Re-run the suite before submission; that count is a historical result, not a claim about the current checkout.
+The suite includes unit/integration coverage for financial operations, concurrent bets, idempotent replay, inbox deduplication, and pending-reference recovery. **The historical result was 88 passing tests across 22 files**; execute the suite in your checkout for an up-to-date count.
 
-Coverage includes financial rules, concurrent BET processing, idempotent replay, inbox deduplication, and pending-reference recovery. Integration tests require the configured PostgreSQL test database and relevant schema migrations.
-
-### Manual HTTP checks completed
-
-- BET: `100.00 -> 70.00`, one `DEBIT` ledger entry.
-- BET replay: same transaction ID, `idempotentReplay: true`, no second debit.
-- WIN: `70.00 -> 90.00`, one `CREDIT` ledger entry.
-- LOSS: reported successful without balance or ledger change.
-- Outbox: transaction and balance-change events observed in `PENDING` state for BET and WIN.
+Manual HTTP checks performed during development included BET, WIN, LOSS, REFUND, ROLLBACK, idempotent replays, and duplicate reversal protection. In a subsequent LOSS test, a changed payload with the same idempotency key was blocked (one persisted transaction), but the API returned HTTP 500 instead of the desired 409.
 
 ## Background workers
 
-The repository includes standalone scripts for:
+| Purpose | Entry point |
+| --- | --- |
+| Outbox publication | `src/infrastructure/messaging/run-outbox-worker.ts` |
+| SQS inbox consumer | `src/infrastructure/messaging/run-sqs-consumer.ts` |
+| One-off reference recovery | `src/infrastructure/messaging/run-pending-reference-recovery.ts` |
+| Periodic reference recovery | `src/infrastructure/messaging/run-pending-reference-recovery-worker.ts` |
 
-- Outbox publication to SQS FIFO (`src/infrastructure/messaging/run-outbox-worker.ts`).
-- SQS inbox consumption (`src/infrastructure/messaging/run-sqs-consumer.ts`).
-- One-off pending-reference recovery (`src/infrastructure/messaging/run-pending-reference-recovery.ts`).
-- Periodic pending-reference recovery (`src/infrastructure/messaging/run-pending-reference-recovery-worker.ts`).
+Run these using the Bun invocation appropriate for your package scripts and TypeScript configuration; check the worker entry point and environment before connecting to any non-test service.
 
-Confirm the script invocation mechanism and environment variables in your checkout before running these against a non-test database.
+## Known limitations and next steps
 
-## Remaining verification / production hardening
+1. Map idempotency payload conflicts to **HTTP 409** consistently across all endpoints; verify the exact domain error codes and add an HTTP regression test.
+2. Verify crash/retry scenarios end-to-end for SQS publication and consumption, including duplicate delivery, poison messages, DLQ configuration, and graceful shutdown.
+3. Validate the financial guarantees under **multiple independent service processes**, not only concurrent calls in one process.
+4. Add provider authentication/authorization, structured logs, metrics, and health checks before any production deployment.
+5. Verify a clean-database migration and full integration test run in a reproducible environment.
+6. Review canonical payload hashing rules for normalization (e.g. equivalent monetary representations) and compatibility with legacy test records.
 
-1. Complete end-to-end HTTP tests for REFUND and ROLLBACK, including duplicate reversals and invalid references.
-2. Verify SQS publish/consume/retry behavior end-to-end under failures and duplicate delivery.
-3. Implement provider authentication/authorization and server-generated canonical payload hashes.
-4. Map domain failures and idempotency conflicts to deliberate HTTP error responses.
-5. Review operational observability, secrets handling, deployment configuration, and recovery of poison messages.
-6. Run the complete test suite and verify migrations from a clean database before submission.
+## Further reading
 
-## Design trade-offs
-
-The materialized wallet balance supports efficient reads, while the immutable ledger remains the auditable source for reconciliation. PostgreSQL row locks serialize updates to a single wallet without imposing a global lock across unrelated wallets. The Outbox decouples database commit from external message delivery, accepting at-least-once publication rather than attempting an unsafe distributed transaction.
+- [ARCHITECTURE.md](ARCHITECTURE.md): boundaries, transaction model, concurrency, idempotency, outbox/inbox, recovery, trade-offs, and verification gaps.
 
 ---
 
